@@ -191,7 +191,7 @@ if __name__ == '__main__':
                 fileData = {}
                 for fname in os.listdir(test_output_dir):
                     if fname.startswith('generator'):
-                       	fileData[fname] = os.stat(test_output_dir + '/' + fname).st_mtime
+                        fileData[fname] = os.stat(test_output_dir + '/' + fname).st_mtime
                     else:
                         pass
                 sortedFiles = sorted(fileData.items(), key=itemgetter(1))

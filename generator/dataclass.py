@@ -6,14 +6,14 @@ import json
 from torch.nn.utils import rnn
 import progressbar
 from transformers import BartTokenizer, BartTokenizerFast, BartConfig
-from transformers.modeling_bart import shift_tokens_right
+from transformers.models.bart.modeling_bart import shift_tokens_right
 from data_utlis import load_ordered_cell_list
 
 UNSEEN_SLOT_KEY, EOS, SEP = '__None__', '__EOS__', '__SEP__'
 
 class Data:
     def __init__(self, train_data_dict, dev_data_dict, max_table_len, max_content_plan_len, max_tgt_len, 
-        model_name, special_token_path, min_slot_key_cnt, use_RL):
+        model_name, special_token_path, min_slot_key_cnt, use_RL, off_policy=True):
 
         self.max_table_len, self.max_content_plan_len, self.max_tgt_len = \
         max_table_len, max_content_plan_len, max_tgt_len
@@ -75,6 +75,10 @@ class Data:
         self.train_idx_list = [i for i in range(self.train_num)]
         self.dev_idx_list = [j for j in range(self.dev_num)]
         self.dev_current_idx = 0
+
+        if use_RL and off_policy: # set variables for saving old logprobs
+            self.old_logprobs = []
+
 
     def load_one_text_id(self, text, max_len):
         text_id_list = self.tokenizer.encode(text, max_length=512, truncation=True, add_special_tokens=False)[:max_len]
@@ -153,7 +157,7 @@ class Data:
         batch_tgt_tensor = [torch.LongTensor(item) for item in batch_tgt_id_list]
         batch_tgt_tensor = rnn.pad_sequence(batch_tgt_tensor, batch_first=True, padding_value=self.tokenizer.pad_token_id)
         batch_labels = batch_tgt_tensor
-        batch_input = shift_tokens_right(batch_labels, self.tokenizer.pad_token_id)
+        batch_input = shift_tokens_right(batch_labels, self.tokenizer.pad_token_id, self.tokenizer.bos_token_id)
         batch_labels[batch_labels[:, :] == self.tokenizer.pad_token_id] = -100
         return batch_input, batch_labels 
 
@@ -196,7 +200,8 @@ class Data:
         batch_tgt_in_tensor, batch_tgt_out_tensor = self.process_decoder_tensor(batch_tgt_id_list)
         return (batch_table_tensor, batch_table_mask), (batch_content_tensor, batch_content_mask), \
         (batch_src_tensor, batch_src_mask), (batch_tgt_in_tensor, batch_tgt_out_tensor), \
-        (batch_ordered_cell_list, batch_reference_text_list, batch_content_plan_list)
+        (batch_ordered_cell_list, batch_reference_text_list, batch_content_plan_list), \
+        batch_idx_list
 
     def get_next_dev_batch(self, batch_size):
         batch_table_id_list, batch_content_id_list, batch_src_id_list, batch_tgt_id_list = [], [], [], []
@@ -252,3 +257,18 @@ class Data:
         (batch_src_tensor, batch_src_mask), (batch_tgt_in_tensor, batch_tgt_out_tensor), \
         (batch_ordered_cell_list, batch_reference_text_list, batch_content_plan_list)
 
+
+    def get_logprobs(self, batch_idx_list):
+        '''
+        Get appropriate old logprobs for off policy RL
+        returns in pytorch tensor
+        '''
+        return self.old_logprobs[batch_idx_list]
+
+
+    def save_logprobs(self, logprobs, batch_idx_list):
+        '''
+        Save current logprobs for next learning step when using off-policy RL methods
+        '''
+        for lp_idx, batch_idx in enumerate(batch_idx_list):
+            self.old_logprobs[batch_idx] = logprobs[lp_idx] # logprob는 순서대로 불러와야 함 

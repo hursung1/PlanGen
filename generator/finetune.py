@@ -18,6 +18,7 @@ from subprocess import call
 from data_utlis import reward_estimation, dev_corpus_bleu_estimation
 import argparse
 from dataclass import Data
+from generator import Generator
 
 def parse_config():
     parser = argparse.ArgumentParser()
@@ -54,6 +55,8 @@ def parse_config():
     parser.add_argument('--pretrained_ckpt_path', type=str, default='./ckpt/pretrain/generator-pretrain.ckpt')
     parser.add_argument('--ckpt_path', type=str, default='./ckpt/finetune/')
     parser.add_argument('--RL_topk', type=int, default=50)
+    parser.add_argument('--off_policy', type=bool, default=False)
+    parser.add_argument('--eps', type=float, default=0.2)
     parser.add_argument('--temperature', type=float, default=1.5)
     return parser.parse_args()
 
@@ -98,11 +101,10 @@ if __name__ == '__main__':
 
     use_RL = True
     data = Data(train_dict, dev_dict, args.max_table_len, args.max_content_plan_len, args.max_tgt_len, 
-        args.model_name, args.special_token_path, args.min_slot_key_cnt, use_RL)
+        args.model_name, args.special_token_path, args.min_slot_key_cnt, use_RL, off_policy=args.off_policy)
 
-    from generator import Generator
     model = Generator(model_name=args.model_name, tokenizer=data.decode_tokenizer, 
-            max_decode_len=args.max_decode_len, dropout=args.dropout)
+            max_decode_len=args.max_decode_len, dropout=args.dropout, off_policy=args.off_policy)
 
     print ('Loading Pretrained Parameters...')
     if torch.cuda.is_available():
@@ -127,12 +129,11 @@ if __name__ == '__main__':
     train_step_num = int(train_num / batch_size) + 1
     dev_step_num = int(dev_num / batch_size) + 1
 
+    eps_clip = args.eps
     batches_processed = 0
     max_dev_score = 0.
     total_steps = args.total_steps
     print_every, eval_every = args.print_every, args.eval_every
-
-
 
     model.train()
 
@@ -144,7 +145,7 @@ if __name__ == '__main__':
 
         train_MLE_loss_accumulated, train_RL_loss_accumulated = 0., 0.
 
-        _, _, train_batch_src_item, train_batch_tgt_item, train_batch_RL_input = data.get_next_train_batch(batch_size)
+        _, _, train_batch_src_item, train_batch_tgt_item, train_batch_RL_input, batch_idx_list = data.get_next_train_batch(batch_size)
         train_batch_ordered_cell_list, train_batch_reference_text_list, train_batch_content_plan_list = \
         train_batch_RL_input
 
@@ -162,17 +163,40 @@ if __name__ == '__main__':
             train_indicator_matrix: indicating which entry in the gathered log prob matrix is valid;; bsz x sample_len
         '''
         train_gathered_logprobs, train_indicator_matrix, train_trajectory_list = \
-        model.RL_sampling(train_batch_src_tensor, train_batch_src_mask, top_k=RL_topk, temperature=temperature)
-        # measure reward
-        train_sentence_bleu_list, train_content_plan_bleu_list = reward_estimation(train_batch_reference_text_list, 
-        train_batch_content_plan_list, train_trajectory_list, train_batch_ordered_cell_list)
+            model.RL_sampling(train_batch_src_tensor, train_batch_src_mask, top_k=RL_topk, temperature=temperature)
+        
+        train_sentence_bleu_list, train_content_plan_bleu_list = reward_estimation(train_batch_reference_text_list, train_batch_content_plan_list, train_trajectory_list, train_batch_ordered_cell_list)
         assert len(train_sentence_bleu_list) == batch_size
+            
+        # measure reward
         train_sentence_reward = torch.FloatTensor(train_sentence_bleu_list).type(train_indicator_matrix.type()).unsqueeze(-1)
         assert train_sentence_reward.size() == torch.Size([batch_size, 1])
         train_content_plan_reward = torch.FloatTensor(train_content_plan_bleu_list).type(train_indicator_matrix.type()).unsqueeze(-1)
         train_reward = train_sentence_reward + train_content_plan_reward
         train_sample_logprobs = train_gathered_logprobs * train_indicator_matrix
-        train_RL_term = train_reward * train_sample_logprobs
+        
+        if args.off_policy: # PPO  
+            # if on-policy: get old log probs
+            old_logprobs = data.get_logprobs(batch_idx_list)
+            if old_logprobs is None:
+                old_logprobs = 0.
+            ratios = torch.exp(train_sample_logprobs - old_logprobs)
+
+            # surrogate loss
+            surr1 = ratios * train_reward
+            surr2 = torch.clamp(ratios, 1-eps_clip, 1+eps_clip) * train_reward
+
+            # final loss
+            train_RL_term = torch.min(surr1, surr2) 
+
+            # save logprobs for next step
+            data.save_logprobs(logprobs=train_sample_logprobs, batch_idx_list=batch_idx_list)
+            # model.old_logprobs = train_sample_logprobs
+
+        else: # REINFORCE
+            # RL term
+            train_RL_term = train_reward * train_sample_logprobs
+            
         train_RL_loss = (-1 * torch.sum(train_RL_term)) / torch.sum(train_indicator_matrix)
         train_RL_loss_accumulated += train_RL_loss.item()
         ##########################################################################################################################
