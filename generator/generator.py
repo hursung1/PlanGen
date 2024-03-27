@@ -4,7 +4,7 @@ import torch.nn.functional as F
 from transformers import BartTokenizer, BartForConditionalGeneration, BartConfig
 
 class Generator(nn.Module):
-    def __init__(self, model_name, tokenizer, max_decode_len, dropout):
+    def __init__(self, model_name, tokenizer, max_decode_len, dropout, off_policy=False):
         super().__init__()
         self.tokenizer = tokenizer # tokenizer with extended vocabulary
         self.max_decode_len = max_decode_len
@@ -20,6 +20,9 @@ class Generator(nn.Module):
         self.vocab_size = len(self.tokenizer)
         self.logsftmax = nn.LogSoftmax(dim=-1)
         self.padding_idx = self.tokenizer.pad_token_id
+        self.off_policy = off_policy
+        if self.off_policy:
+            self.old_logprobs = None
 
     def forward(self, src_input, src_mask, tgt_input, tgt_output):
         src_mask = src_mask.type(src_input.type())
@@ -63,5 +66,9 @@ class Generator(nn.Module):
 
         gathered_logprobs = gathered_logprobs * indicator_matrix
         #return track_gathered_logprobs, indicator_matrix, gathered_logprobs, decoded_result_list, sample_output
+
+        # if self.off_policy:
+        #     self.old_logprobs = gathered_logprobs
+            
         return gathered_logprobs, indicator_matrix, decoded_result_list
 

@@ -6,6 +6,7 @@ import sys
 import random
 import torch
 from torch import nn
+from torch.utils.tensorboard import SummaryWriter
 import torch.nn.functional as F
 import numpy as np
 import operator
@@ -19,6 +20,9 @@ from data_utlis import reward_estimation, dev_corpus_bleu_estimation
 import argparse
 from dataclass import Data
 from generator import Generator
+from RL_lib import ppo
+
+writer = SummaryWriter()
 
 def parse_config():
     parser = argparse.ArgumentParser()
@@ -118,7 +122,8 @@ if __name__ == '__main__':
     model.train()
     print ('Model loaded.')
 
-    optimizer = AdamW(model.parameters(), lr=args.learning_rate)
+    # optimizer = AdamW(model.parameters(), lr=args.learning_rate)
+    optimizer = torch.optim.AdamW(params=model.parameters(), lr=args.learning_rate)
     total_update_steps = (args.total_steps // args.gradient_accumulation_steps) + 1
     scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=args.warmup_steps, 
             num_training_steps=total_update_steps)
@@ -155,6 +160,7 @@ if __name__ == '__main__':
         # compute MLE loss
         train_generation_loss = model(train_batch_src_tensor, train_batch_src_mask, train_batch_tgt_in_tensor, train_batch_tgt_out_tensor)
         train_MLE_loss_accumulated += train_generation_loss.item()
+        writer.add_scalar("MLE_loss/train", train_generation_loss.item(), one_step)
 
         ##########################################################################################################################
         # RL loss
@@ -178,27 +184,24 @@ if __name__ == '__main__':
         if args.off_policy: # PPO  
             # if on-policy: get old log probs
             old_logprobs = data.get_logprobs(batch_idx_list)
-            if old_logprobs is None:
-                old_logprobs = 0.
-            ratios = torch.exp(train_sample_logprobs - old_logprobs)
-
-            # surrogate loss
-            surr1 = ratios * train_reward
-            surr2 = torch.clamp(ratios, 1-eps_clip, 1+eps_clip) * train_reward
-
-            # final loss
-            train_RL_term = torch.min(surr1, surr2) 
+            
+            train_RL_term = ppo(train_sample_logprobs, 
+                                old_logprobs, 
+                                train_indicator_matrix, 
+                                eps_clip, 
+                                train_reward, 
+                                device
+                            )
 
             # save logprobs for next step
             data.save_logprobs(logprobs=train_sample_logprobs, batch_idx_list=batch_idx_list)
-            # model.old_logprobs = train_sample_logprobs
 
         else: # REINFORCE
-            # RL term
             train_RL_term = train_reward * train_sample_logprobs
             
         train_RL_loss = (-1 * torch.sum(train_RL_term)) / torch.sum(train_indicator_matrix)
         train_RL_loss_accumulated += train_RL_loss.item()
+        writer.add_scalar("RL_loss/train", train_RL_loss.item(), one_step)
         ##########################################################################################################################
         
         train_loss = train_generation_loss + train_RL_loss
@@ -244,7 +247,7 @@ if __name__ == '__main__':
                 print ('Start evaluation...')
                 for dev_step in range(dev_step_num):
                     p.update(dev_step)
-                    _, _, dev_batch_src_item, dev_batch_tgt_item, dev_batch_RL_input = data.get_next_dev_batch(batch_size)
+                    _, _, dev_batch_src_item, dev_batch_tgt_item, dev_batch_RL_input, batch_idx_list = data.get_next_dev_batch(batch_size)
                     dev_batch_ordered_cell_list, dev_batch_reference_text_list, dev_batch_content_plan_list = \
                     dev_batch_RL_input
 
@@ -256,6 +259,7 @@ if __name__ == '__main__':
                         dev_batch_tgt_in_tensor, dev_batch_tgt_out_tensor)
 
                     dev_MLE_loss_accumulated += dev_generation_loss.item()
+                    writer.add_scalar("MLE_loss/dev", dev_generation_loss.item(), dev_step)
                     ##########################################################################################################################
                     # RL loss
                     dev_gathered_logprobs, dev_indicator_matrix, dev_trajectory_list = \
@@ -269,9 +273,27 @@ if __name__ == '__main__':
                     dev_content_plan_reward = torch.FloatTensor(dev_content_plan_bleu_list).type(dev_indicator_matrix.type()).unsqueeze(-1)
                     dev_reward = dev_sentence_reward + dev_content_plan_reward
                     dev_sample_logprobs = dev_gathered_logprobs * dev_indicator_matrix
-                    dev_RL_term = dev_reward * dev_sample_logprobs
+                    
+                    if args.off_policy:
+                        # if on-policy: get old log probs
+                        old_logprobs = data.get_logprobs(batch_idx_list)
+                        
+                        dev_RL_term = ppo(dev_sample_logprobs, 
+                                            old_logprobs, 
+                                            dev_indicator_matrix, 
+                                            eps_clip, 
+                                            dev_reward, 
+                                            device
+                                        )
+
+                        # save logprobs for next step
+                        data.save_logprobs(logprobs=dev_sample_logprobs, batch_idx_list=batch_idx_list)
+                    else:
+                        dev_RL_term = dev_reward * dev_sample_logprobs
+
                     dev_RL_loss = (-1 * torch.sum(dev_RL_term)) / torch.sum(dev_indicator_matrix)
                     dev_RL_loss_accumulated += dev_RL_loss.item()
+                    writer.add_scalar("RL_loss/dev", dev_RL_loss.item(), dev_step)
                     ##########################################################################################################################
                     
                     # evaluation part
@@ -336,4 +358,4 @@ if __name__ == '__main__':
                         os.remove(test_output_dir + '/' + sortedFiles[x][0])
             model.train()
 
-    
+    writer.close()

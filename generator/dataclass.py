@@ -77,7 +77,7 @@ class Data:
         self.dev_current_idx = 0
 
         if use_RL and off_policy: # set variables for saving old logprobs
-            self.old_logprobs = []
+            self.old_logprobs = [torch.zeros(1, dtype=torch.float, requires_grad=False) for _ in range(self.train_num)]
 
 
     def load_one_text_id(self, text, max_len):
@@ -206,6 +206,7 @@ class Data:
     def get_next_dev_batch(self, batch_size):
         batch_table_id_list, batch_content_id_list, batch_src_id_list, batch_tgt_id_list = [], [], [], []
         batch_ordered_cell_list, batch_reference_text_list, batch_content_plan_list = [], [], []
+        batch_idx_list = []
         if self.dev_current_idx + batch_size < self.dev_num - 1:
             for i in range(batch_size):
                 curr_idx = self.dev_current_idx + i
@@ -224,7 +225,10 @@ class Data:
                 batch_reference_text_list.append(one_reference_text)
                 one_content_plan = self.dev_reference_content_plan_list[curr_idx]
                 batch_content_plan_list.append(one_content_plan)
+                batch_idx_list.append(curr_idx)
+
             self.dev_current_idx += batch_size
+
         else:
             for i in range(batch_size):
                 curr_idx = self.dev_current_idx + i
@@ -248,22 +252,33 @@ class Data:
                 batch_reference_text_list.append(one_reference_text)
                 one_content_plan = self.dev_reference_content_plan_list[curr_idx]
                 batch_content_plan_list.append(one_content_plan)
+                batch_idx_list.append(curr_idx)
+
             self.dev_current_idx = 0
+
         batch_table_tensor, batch_table_mask = self.process_source_tensor(batch_table_id_list)
         batch_content_tensor, batch_content_mask = self.process_source_tensor(batch_content_id_list)
         batch_src_tensor, batch_src_mask = self.process_source_tensor(batch_src_id_list)
         batch_tgt_in_tensor, batch_tgt_out_tensor = self.process_decoder_tensor(batch_tgt_id_list)
         return (batch_table_tensor, batch_table_mask), (batch_content_tensor, batch_content_mask), \
         (batch_src_tensor, batch_src_mask), (batch_tgt_in_tensor, batch_tgt_out_tensor), \
-        (batch_ordered_cell_list, batch_reference_text_list, batch_content_plan_list)
-
+        (batch_ordered_cell_list, batch_reference_text_list, batch_content_plan_list), \
+        batch_idx_list
 
     def get_logprobs(self, batch_idx_list):
         '''
         Get appropriate old logprobs for off policy RL
         returns in pytorch tensor
         '''
-        return self.old_logprobs[batch_idx_list]
+        old_logprobs = []
+        for bid in batch_idx_list:
+            old_logprobs.append(self.old_logprobs[bid])
+        
+        return old_logprobs
+        # if self.old_logprobs is None:
+        #     return None
+        # else:
+        #     return self.old_logprobs[batch_idx_list]
 
 
     def save_logprobs(self, logprobs, batch_idx_list):
@@ -271,4 +286,4 @@ class Data:
         Save current logprobs for next learning step when using off-policy RL methods
         '''
         for lp_idx, batch_idx in enumerate(batch_idx_list):
-            self.old_logprobs[batch_idx] = logprobs[lp_idx] # logprob는 순서대로 불러와야 함 
+            self.old_logprobs[batch_idx] = logprobs[lp_idx].detach() # logprob는 순서대로 불러와야 함 
